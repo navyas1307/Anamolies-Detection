@@ -55,11 +55,9 @@ Anamolies-Detector/
 │
 ├── server/                     # Backend and ML logic
 │   ├── app.py                  # Flask app to handle API routes
-│   ├── model.py                # Anomaly detection logic (Isolation Forest, LOF)
+│   ├──data_simulator.py
+|   |── model.py                # Anomaly detection logic (Isolation Forest, LOF)
 │   └── EDA.py                  # Exploratory Data Analysis scripts
-│
-├── data/                       # Sample data or input transaction data
-│   └── transactions.csv
 │
 ├── README.md                   # Project overview and instructions
 ├── requirements.txt            # Python dependencies
