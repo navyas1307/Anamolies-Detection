@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Transaction Risk Monitor</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🛡️ Transaction Risk Monitor</h1>
+            <div class="status-indicator">
+                <span id="connectionStatus" class="status-dot online"></span>
+                <span>Live Feed Active</span>
+            </div>
+        </header>
+
+        <div class="main-layout">
+            <aside class="sidebar">
+                <div class="filter-section">
+                    <h3>Filters</h3>
+                    
+                    <div class="filter-group">
+                        <label for="customerFilter">Customer ID</label>
+                        <input type="text" id="customerFilter" placeholder="Enter customer ID">
+                    </div>
+                    
+                    <div class="filter-group">
+                        <label for="riskFilter">Risk Level</label>
+                        <select id="riskFilter">
+                            <option value="">All Levels</option>
+                            <option value="High">High Risk</option>
+                            <option value="Medium">Medium Risk</option>
+                            <option value="Low">Low Risk</option>
+                        </select>
+                    </div>
+                    
+                    <div class="filter-group">
+                        <label for="dateFrom">Date From</label>
+                        <input type="date" id="dateFrom">
+                    </div>
+                    
+                    <div class="filter-group">
+                        <label for="dateTo">Date To</label>
+                        <input type="date" id="dateTo">
+                    </div>
+                    
+                    <button id="applyFilters" class="btn-primary">Apply Filters</button>
+                    <button id="clearFilters" class="btn-secondary">Clear</button>
+                </div>
+            </aside>
+
+            <main class="content">
+                <div class="summary-cards">
+                    <div class="card">
+                        <h4>Total Transactions</h4>
+                        <div class="card-value" id="totalTxns">0</div>
+                    </div>
+                    <div class="card">
+                        <h4>High Risk</h4>
+                        <div class="card-value high-risk" id="highRiskCount">0</div>
+                    </div>
+                    <div class="card">
+                        <h4>Medium Risk</h4>
+                        <div class="card-value medium-risk" id="mediumRiskCount">0</div>
+                    </div>
+                    <div class="card">
+                        <h4>Low Risk</h4>
+                        <div class="card-value low-risk" id="lowRiskCount">0</div>
+                    </div>
+                </div>
+
+                <div class="table-controls">
+                    <div class="controls-left">
+                        <button id="pauseStream" class="btn-secondary">Pause Stream</button>
+                        <button id="resumeStream" class="btn-secondary" style="display: none;">Resume Stream</button>
+                        <span id="streamStatus" class="stream-status">Streaming...</span>
+                    </div>
+                    <div class="controls-right">
+                        <button id="downloadCsv" class="btn-primary">Download CSV</button>
+                        <button id="clearTable" class="btn-secondary">Clear Table</button>
+                    </div>
+                </div>
+
+                <div class="table-container">
+                    <table id="txnTable">
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Customer ID</th>
+                                <th>Amount</th>
+                                <th>Merchant</th>
+                                <th>Category</th>
+                                <th>Score</th>
+                                <th>Risk</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="txnTableBody">
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="loading-overlay" id="loadingOverlay">
+                    <div class="spinner"></div>
+                    <p>Loading transactions...</p>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
