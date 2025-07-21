@@ -46,10 +46,22 @@ This is an end-to-end fraud detection system developed during a banking internsh
 ## Code Structure
 
 ```bash
-.
-├── app.py                # Flask API for scoring transactions
-├── train.py              # Training pipeline for AE & IF
-├── EDA.py                # Exploratory data analysis and cleaning
-├── data_simulator.py     # Real-time transaction simulator
-├── cleaned_fraud_data.csv
-└── metadata.json         # Model metadata and feature schema
+Anamolies-Detector/
+│
+├── frontend/                    # Frontend files (HTML, CSS, JS)
+│   ├── index.html              # Main web interface
+│   ├── style.css               # Styling for the UI
+│   └── script.js               # Frontend logic and API calls
+│
+├── server/                     # Backend and ML logic
+│   ├── app.py                  # Flask app to handle API routes
+│   ├── model.py                # Anomaly detection logic (Isolation Forest, LOF)
+│   └── EDA.py                  # Exploratory Data Analysis scripts
+│
+├── data/                       # Sample data or input transaction data
+│   └── transactions.csv
+│
+├── README.md                   # Project overview and instructions
+├── requirements.txt            # Python dependencies
+└── .gitignore                  # Files/folders to ignore in version control
+
