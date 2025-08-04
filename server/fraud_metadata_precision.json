@@ -1,0 +1,37 @@
+{
+  "feature_cols": [
+    "merchant_avg_amount",
+    "merchant_diversity",
+    "amount_sqrt",
+    "cust_amt_mean",
+    "merchant_risk_score",
+    "amount_square",
+    "cust_amt_sum",
+    "cust_amt_range",
+    "cust_amt_iqr",
+    "cust_amt_median",
+    "amt_vs_cust_mean_ratio",
+    "cust_amt_cv",
+    "is_very_high_amount",
+    "cust_amt_skewness",
+    "amt_vs_cust_q95_ratio",
+    "amount_vs_merchant_avg",
+    "cust_txn_count",
+    "is_cust_extreme_spender",
+    "is_extreme_amount",
+    "is_high_risk_merchant"
+  ],
+  "hybrid_threshold": 0.5127470090934427,
+  "weights": {
+    "isolation_forest": 0.6,
+    "autoencoder": 0.4
+  },
+  "input_dim": 20,
+  "model_type": "enhanced_precision_focused_hybrid",
+  "training_date": "2025-07-30T20:23:51.621604",
+  "target_precision": 0.72,
+  "target_recall": 0.8,
+  "optimization": "enhanced_precision_boosting",
+  "num_features": 20,
+  "precision_boost_factor": 1.15
+}
