@@ -3,7 +3,7 @@
 ![Python](https://img.shields.io/badge/python-v3.10+-blue.svg)
 ![PyTorch](https://img.shields.io/badge/PyTorch-red.svg)
 ![Flask](https://img.shields.io/badge/Flask-green.svg)
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
+
 
 A production-ready fraud detection engine that combines **Isolation Forest** and **Autoencoder** models to flag suspicious financial transactions in real-time. Designed and deployed during internship at **Punjab National Bank**, this system supports **real-time API scoring**, **synthetic transaction simulation**, and an interactive **dashboard interface**.
 
