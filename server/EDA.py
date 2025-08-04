@@ -89,52 +89,15 @@ def simple_eda(df):
             for cat, rate in fraud_by_cat.head().items():
                 print(f"{cat}: {rate:.1%}")
 
-def create_simple_plots(df):
-    """Create simple visualizations"""
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    
-    # 1. Fraud pie chart
-    if 'fraud' in df.columns:
-        fraud_counts = df['fraud'].value_counts()
-        axes[0,0].pie(fraud_counts.values, labels=['Normal', 'Fraud'], 
-                     autopct='%1.1f%%', colors=['lightgreen', 'lightcoral'])
-        axes[0,0].set_title('Fraud vs Normal')
-    
-    # 2. Amount histogram
-    if 'amount' in df.columns:
-        axes[0,1].hist(df['amount'], bins=30, alpha=0.7, color='skyblue')
-        axes[0,1].set_title('Amount Distribution')
-        axes[0,1].set_xlabel('Amount')
-    
-    # 3. Category bar chart
-    if 'category' in df.columns:
-        cat_counts = df['category'].value_counts()
-        axes[1,0].bar(range(len(cat_counts)), cat_counts.values, color='lightblue')
-        axes[1,0].set_title('Transactions by Category')
-        axes[1,0].set_xticks(range(len(cat_counts)))
-        axes[1,0].set_xticklabels(cat_counts.index, rotation=45)
-    
-    # 4. Fraud rate by category
-    if 'category' in df.columns and 'fraud' in df.columns:
-        fraud_rate = df.groupby('category')['fraud'].mean()
-        axes[1,1].bar(range(len(fraud_rate)), fraud_rate.values, color='lightcoral')
-        axes[1,1].set_title('Fraud Rate by Category')
-        axes[1,1].set_xticks(range(len(fraud_rate)))
-        axes[1,1].set_xticklabels(fraud_rate.index, rotation=45)
-        axes[1,1].set_ylabel('Fraud Rate')
-    
-    plt.tight_layout()
-    plt.show()
 
 # Main execution
-df = clean_data("bs140513_032310.csv")
+df = clean_data("./server/bs140513_032310.csv")
+
 
 if df is not None:
     # Run simple analysis
     simple_eda(df)
     
-    # Create visualizations
-    create_simple_plots(df)
     
     # Save cleaned data
     clean_filename = "cleaned_fraud_data.csv"
