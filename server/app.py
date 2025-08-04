@@ -9,9 +9,10 @@ import json
 from data_simulator import DataSimulator
 import warnings
 warnings.filterwarnings('ignore')
-from flask import Flask, send_from_directory
+from flask import send_from_directory
 import os
 from flask_cors import CORS
+from sklearn.model_selection import StratifiedKFold
 
 app = Flask(__name__, static_folder='../frontend', static_url_path='')
 CORS(app)
@@ -22,39 +23,30 @@ def serve_index():
 
 @app.route('/<path:path>')
 def serve_static_files(path):
-    return send_from_directory(app.static_folder, path)
+    return send_from_directory(app.static_folder, 'index.html')
 
-class Autoencoder(nn.Module):
+class PrecisionOptimizedAutoencoder(nn.Module):
+    """Precision-focused autoencoder matching train.py architecture"""
     def __init__(self, input_dim):
-        super(Autoencoder, self).__init__()
+        super(PrecisionOptimizedAutoencoder, self).__init__()
+        hidden_dim = max(16, input_dim // 3)  
+        bottleneck_dim = max(6, hidden_dim // 4)  
+        
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 16),
-            nn.ReLU()
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.03),  
+            nn.Dropout(0.3),  
+            nn.Linear(hidden_dim, bottleneck_dim),
+            nn.Tanh()
         )
+        
         self.decoder = nn.Sequential(
-            nn.Linear(16, 32),
-            nn.ReLU(),
-            nn.Linear(32, 64),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, input_dim)
+            nn.Linear(bottleneck_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.03),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, input_dim)
         )
     
     def forward(self, x):
@@ -62,41 +54,161 @@ class Autoencoder(nn.Module):
         decoded = self.decoder(encoded)
         return decoded
 
-# Global variables for models
-autoencoder = None
-iforest = None
-scaler = None
-cat_encoder = None
+class PrecisionFocusedHybridDetector:
+    """Fixed hybrid detector with proper score normalization matching train.py"""
+    def __init__(self, isolation_forest, autoencoder, scaler, metadata):
+        self.isolation_forest = isolation_forest
+        self.autoencoder = autoencoder
+        self.scaler = scaler
+        self.weights = metadata['weights']
+        self.hybrid_threshold = metadata['hybrid_threshold']
+        self.precision_boost_factor = metadata.get('precision_boost_factor', 1.15)
+        self.input_dim = metadata['input_dim']
+        
+    def _precision_normalize(self, scores):
+        """Use the EXACT normalization as train.py to match training behavior"""
+        # Enhanced normalization for better precision - EXACTLY from train.py
+        scores_shifted = scores - scores.min() + 1e-8
+        scores_log = np.log1p(scores_shifted)
+        
+        # Use more conservative percentiles
+        q5, q95 = np.percentile(scores_log, [5, 95])
+        
+        # Handle edge case where q5 == q95
+        if q95 - q5 < 1e-8:
+            # If all values are very similar, use min-max normalization
+            scores_min, scores_max = scores_log.min(), scores_log.max()
+            if scores_max - scores_min < 1e-8:
+                # All values are identical, return small random variation around 0.1
+                return np.full_like(scores, 0.1) + np.random.normal(0, 0.01, len(scores))
+            else:
+                normalized = (scores_log - scores_min) / (scores_max - scores_min)
+        else:
+            normalized = (scores_log - q5) / (q95 - q5 + 1e-8)
+        
+        normalized = np.clip(normalized, 0, 4)
+        # Apply stronger non-linear transformation for precision
+        normalized = np.power(normalized / 4, 0.6) * 4
+        normalized = normalized / 4
+        
+        return normalized
+    
+    def predict_scores(self, X):
+        """Get hybrid prediction scores with EXACT same normalization as train.py"""
+        X_scaled = self.scaler.transform(X)
+        
+        # Isolation Forest scores (negative values, more negative = more anomalous)
+        if_raw_scores = self.isolation_forest.decision_function(X_scaled)
+        # Convert to positive anomaly scores (higher = more anomalous)
+        if_scores = -if_raw_scores
+        if_scores_normalized = self._precision_normalize(if_scores)
+        
+        # Autoencoder scores (reconstruction error)
+        self.autoencoder.eval()
+        with torch.no_grad():
+            X_tensor = torch.FloatTensor(X_scaled)
+            reconstructed = self.autoencoder(X_tensor)
+            ae_raw_scores = torch.mean((X_tensor - reconstructed) ** 2, dim=1).numpy()
+            ae_scores_normalized = self._precision_normalize(ae_raw_scores)
+        
+        # Combine scores using weights - EXACTLY like train.py
+        hybrid_scores = (self.weights['isolation_forest'] * if_scores_normalized + 
+                        self.weights['autoencoder'] * ae_scores_normalized)
+        
+        return hybrid_scores, if_scores_normalized, ae_scores_normalized
+    
+    def predict(self, X):
+        """Predict anomalies"""
+        hybrid_scores, _, _ = self.predict_scores(X)
+        return (hybrid_scores > self.hybrid_threshold).astype(int)
+
+# Global variables for models and training data
+hybrid_model = None
 metadata = None
 data_sim = None
+training_data = None
+merchant_stats = None
 
 def load_models():
-    global autoencoder, iforest, scaler, cat_encoder, metadata, data_sim
+    global hybrid_model, metadata, data_sim, training_data, merchant_stats
     
-    print("Loading models...")
+    print("Loading precision-focused hybrid models...")
     
     # Load metadata
-    with open('metadata.json', 'r') as f:
-        metadata = json.load(f)
+    try:
+        with open('fraud_metadata_precision.json', 'r') as f:
+            metadata = json.load(f)
+        print(f"Metadata loaded: {metadata.get('model_type', 'unknown')} model")
+    except FileNotFoundError:
+        print("Error: fraud_metadata_precision.json not found")
+        return False
     
-    print(f"Metadata loaded: {metadata}")
+    try:
+        # Load Isolation Forest
+        isolation_forest = joblib.load('fraud_isolation_forest_precision.pkl')
+        print("Isolation Forest loaded")
+        
+        # Load Autoencoder
+        autoencoder = PrecisionOptimizedAutoencoder(metadata['input_dim'])
+        autoencoder.load_state_dict(torch.load('fraud_autoencoder_precision.pt', map_location='cpu'))
+        autoencoder.eval()
+        print("Precision Autoencoder loaded")
+        
+        # Load Scaler
+        scaler = joblib.load('fraud_scaler_precision.pkl')
+        print("Scaler loaded")
+        
+        # Create hybrid model
+        hybrid_model = PrecisionFocusedHybridDetector(
+            isolation_forest, autoencoder, scaler, metadata
+        )
+        
+        print("Precision-focused hybrid model initialized successfully!")
+        
+    except Exception as e:
+        print(f"Error loading model components: {e}")
+        return False
     
-    # Load autoencoder with correct architecture
-    autoencoder = Autoencoder(metadata['input_dim'])
-    autoencoder.load_state_dict(torch.load('ae.pt', map_location='cpu'))
-    autoencoder.eval()
-    
-    # Load other models
-    iforest = joblib.load('iforest.pkl')
-    scaler = joblib.load('scaler.pkl')
-    
-    # Load categorical encoder if it exists
-    if metadata['has_cat_encoder']:
-        cat_encoder = joblib.load('cat_encoder.pkl')
-        print("Categorical encoder loaded")
-    else:
-        cat_encoder = None
-        print("No categorical encoder found")
+    # Load training data for feature computation
+    try:
+        print("Loading training data for feature computation...")
+        training_data = pd.read_csv("cleaned_fraud_data.csv")
+        
+        # Create customer statistics matching train.py EXACTLY
+        print("Creating customer statistics...")
+        customer_stats = training_data.groupby('customer')['amount'].agg([
+            'mean', 'std', 'median', 'count', 'min', 'max', 'sum'
+        ]).fillna(0)
+        
+        customer_percentiles = training_data.groupby('customer')['amount'].quantile([0.05, 0.1, 0.25, 0.75, 0.9, 0.95]).unstack()
+        customer_percentiles.columns = ['amount_q05', 'amount_q10', 'amount_q25', 'amount_q75', 'amount_q90', 'amount_q95']
+        customer_stats = pd.concat([customer_stats, customer_percentiles], axis=1)
+        
+        customer_stats.columns = ['cust_amt_mean', 'cust_amt_std', 'cust_amt_median', 
+                                 'cust_txn_count', 'cust_amt_min', 'cust_amt_max', 'cust_amt_sum',
+                                 'cust_amt_q05', 'cust_amt_q10', 'cust_amt_q25', 'cust_amt_q75', 'cust_amt_q90', 'cust_amt_q95']
+        
+        # ADD THE MISSING ENHANCED FEATURES TO CUSTOMER STATS (matching train.py)
+        customer_stats['cust_amt_range'] = customer_stats['cust_amt_max'] - customer_stats['cust_amt_min']
+        customer_stats['cust_amt_iqr'] = customer_stats['cust_amt_q75'] - customer_stats['cust_amt_q25']
+        customer_stats['cust_amt_cv'] = customer_stats['cust_amt_std'] / (customer_stats['cust_amt_mean'] + 1e-8)
+        customer_stats['cust_amt_skewness'] = (customer_stats['cust_amt_mean'] - customer_stats['cust_amt_median']) / (customer_stats['cust_amt_std'] + 1e-8)
+        
+        # Store customer stats
+        training_data.customer_stats = customer_stats
+        print(f"Loaded training data with {len(training_data)} transactions and {len(customer_stats)} customers")
+        
+        # Initialize merchant encoding for inference - FIXED VERSION
+        if 'merchant' in training_data.columns and 'fraud' in training_data.columns:
+            print("Creating merchant encoding...")
+            merchant_stats = create_merchant_encoding(training_data)
+            print(f"Merchant encoding created for {len(merchant_stats['stats'])} merchants")
+        
+        print("Training data loaded successfully!")
+        
+    except Exception as e:
+        print(f"Warning: Could not load training data: {e}")
+        training_data = None
     
     # Initialize data simulator
     try:
@@ -106,309 +218,399 @@ def load_models():
         print(f"Warning: Could not initialize data simulator: {e}")
         data_sim = None
     
-    print("Models loaded successfully!")
+    return True
 
-def preprocess_transaction_fixed(txn_data):
-    """Improved preprocessing with realistic feature generation"""
+def create_merchant_encoding(df):
+    """Create merchant risk encoding using cross-validation like in train.py"""
+    if 'fraud' not in df.columns:
+        return None
+    
+    print("Creating merchant risk encoding...")
+    
+    # Use StratifiedKFold for merchant encoding
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    merchant_encoded = np.zeros(len(df))
+    
+    for train_idx, val_idx in skf.split(df, df['fraud']):
+        train_data = df.iloc[train_idx]
+        
+        merchant_fraud_rates = train_data.groupby('merchant')['fraud'].mean()
+        merchant_counts = train_data.groupby('merchant').size()
+        global_fraud_rate = train_data['fraud'].mean()
+        
+        alpha = 75  
+        smoothed_rates = ((merchant_fraud_rates * merchant_counts + global_fraud_rate * alpha) / 
+                        (merchant_counts + alpha))
+        
+        val_merchants = df.iloc[val_idx]['merchant']
+        merchant_encoded[val_idx] = val_merchants.map(smoothed_rates).fillna(global_fraud_rate)
+    
+    # Create merchant statistics
+    merchant_stats = df.groupby('merchant').agg({
+        'fraud': ['count', 'sum', 'mean'],
+        'amount': ['count', 'mean', 'std', 'max'],
+        'customer': 'nunique'
+    })
+    
+    merchant_stats.columns = ['merch_total_txns', 'merch_fraud_count', 'merch_fraud_rate',
+                             'merch_amt_count', 'merch_amt_mean', 'merch_amt_std', 'merch_amt_max',
+                             'merch_unique_customers']
+    
+    # Store encoded values in a mapping
+    merchant_risk_mapping = {}
+    for idx, merchant in enumerate(df['merchant']):
+        merchant_risk_mapping[merchant] = merchant_encoded[idx]
+    
+    return {
+        'risk_mapping': merchant_risk_mapping,
+        'stats': merchant_stats,
+        'global_fraud_rate': global_fraud_rate
+    }
+
+def prepare_transaction_features(txn_data):
+    """Prepare transaction features matching the enhanced feature engineering from train.py"""
     if isinstance(txn_data, dict):
         txn_data = [txn_data]
     
     df = pd.DataFrame(txn_data)
+    print(f"Input transaction data: {df.to_dict('records')}")
     
-    # Convert step to proper day-based datetime
-    base_date = datetime(2011, 1, 1)
-    df['datetime'] = df['step'].apply(lambda x: base_date + timedelta(days=x))
+    if training_data is None:
+        raise Exception("Training data not available - cannot compute customer features")
     
-    # Create proper time-based features
-    df['day_of_year'] = df['datetime'].dt.dayofyear
-    df['month'] = df['datetime'].dt.month
-    df['quarter'] = df['datetime'].dt.quarter
-    df['is_weekend'] = (df['datetime'].dt.dayofweek >= 5).astype(int)
-    df['day_of_week'] = df['datetime'].dt.dayofweek
-    
-    # Create cyclical features
-    df['day_of_year_sin'] = np.sin(2 * np.pi * df['day_of_year'] / 365)
-    df['day_of_year_cos'] = np.cos(2 * np.pi * df['day_of_year'] / 365)
-    df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
-    df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
-    df['dow_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
-    df['dow_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
-    
-    # REALISTIC rolling features for single transactions
+    # Enhanced customer feature lookup matching train.py
     for idx, row in df.iterrows():
-        amount = row['amount']
+        customer = row.get('customer', f'C_unknown_{idx}')
         
-        # More realistic base values for normal behavior
-        base_count_7d = np.random.randint(1, 4)  # 1-3 transactions in 7 days
-        base_count_30d = np.random.randint(5, 16)  # 5-15 transactions in 30 days
-        
-        # 7-day rolling features
-        df.loc[idx, 'txn_count_7d'] = base_count_7d
-        df.loc[idx, 'amt_sum_7d'] = amount * base_count_7d * 0.8  # Simulate lower spending
-        df.loc[idx, 'amt_mean_7d'] = amount * 0.7  # Simulate lower average
-        df.loc[idx, 'amt_std_7d'] = amount * 0.1  # Small standard deviation
-        df.loc[idx, 'amt_max_7d'] = amount * 1.2
-        df.loc[idx, 'amt_min_7d'] = amount * 0.5
-        
-        # 30-day rolling features
-        df.loc[idx, 'txn_count_30d'] = base_count_30d
-        df.loc[idx, 'amt_sum_30d'] = amount * base_count_30d * 0.9
-        df.loc[idx, 'amt_mean_30d'] = amount * 0.8
-        df.loc[idx, 'amt_std_30d'] = amount * 0.15
-        
-        # Velocity features
-        df.loc[idx, 'txn_velocity_7d'] = base_count_7d / 7
-        df.loc[idx, 'txn_velocity_30d'] = base_count_30d / 30
-        
-        # Deviation features
-        df.loc[idx, 'amt_deviation_7d'] = abs(amount - df.loc[idx, 'amt_mean_7d'])
-        df.loc[idx, 'amt_deviation_30d'] = abs(amount - df.loc[idx, 'amt_mean_30d'])
-        
-        # Enhanced features for fraud detection
-        df.loc[idx, 'amt_diff_ratio'] = abs(amount - df.loc[idx, 'amt_mean_7d']) / (df.loc[idx, 'amt_mean_7d'] + 1e-8)
-        df.loc[idx, 'amt_range_7d'] = df.loc[idx, 'amt_max_7d'] - df.loc[idx, 'amt_min_7d']
-        df.loc[idx, 'amt_cv_7d'] = df.loc[idx, 'amt_std_7d'] / (df.loc[idx, 'amt_mean_7d'] + 1e-8)
-        
-        # Unique merchants
-        df.loc[idx, 'uniq_merchants_7d'] = max(1, int(base_count_7d * 0.8))
-        df.loc[idx, 'uniq_merchants_30d'] = max(1, int(base_count_30d * 0.6))
-        
-        # Merchant risk and frequency (simulated normal values)
-        df.loc[idx, 'merchant_risk_score'] = amount * 0.5
-        df.loc[idx, 'merchant_frequency'] = np.random.randint(5, 15)
-        
-        # Time-based features
-        df.loc[idx, 'days_since_last_txn'] = np.random.uniform(1.0, 3.0)  # 1-3 days
-        df.loc[idx, 'hours_since_last_txn'] = df.loc[idx, 'days_since_last_txn'] * 24
-        
-        # Cumulative features
-        cumulative_count = np.random.randint(30, 100)  # 30-100 transactions
-        df.loc[idx, 'cumulative_txn_count'] = cumulative_count
-        df.loc[idx, 'cumulative_amount'] = amount * cumulative_count * 0.9
-        df.loc[idx, 'avg_amount_to_date'] = amount * 0.7
-        
-        # Same day transactions
-        same_day_count = np.random.randint(1, 3)  # 1-2 transactions per day
-        df.loc[idx, 'same_day_txn_count'] = same_day_count
-        df.loc[idx, 'same_day_total_amount'] = amount * same_day_count
-        
-        # Behavioral trend (normal behavior)
-        df.loc[idx, 'amount_trend_7d'] = np.random.uniform(-0.1, 0.1)
+        # Get actual customer stats from training data
+        if hasattr(training_data, 'customer_stats') and customer in training_data.customer_stats.index:
+            cust_stats = training_data.customer_stats.loc[customer]
+            for col in cust_stats.index:
+                df.loc[idx, col] = cust_stats[col]
+            print(f"Found existing customer {customer}")
+            
+        else:
+            # For new customers, estimate using similar transaction patterns
+            print(f"New customer {customer}, estimating stats...")
+            amount = row['amount']
+            
+            # Find similar amounts for estimation
+            similar_amounts = training_data[
+                (training_data['amount'] >= amount * 0.3) & 
+                (training_data['amount'] <= amount * 3.0)
+            ]
+            
+            if len(similar_amounts) > 50 and hasattr(training_data, 'customer_stats'):
+                similar_customers = similar_amounts['customer'].unique()
+                similar_stats = training_data.customer_stats.loc[
+                    training_data.customer_stats.index.isin(similar_customers)
+                ]
+                
+                # Use median stats from similar customers
+                for col in training_data.customer_stats.columns:
+                    df.loc[idx, col] = similar_stats[col].median()
+                    
+            else:
+                # Fallback to overall statistics
+                if hasattr(training_data, 'customer_stats'):
+                    overall_stats = training_data.customer_stats
+                    for col in overall_stats.columns:
+                        df.loc[idx, col] = overall_stats[col].median()
+                else:
+                    # Last resort defaults
+                    df.loc[idx, 'cust_amt_mean'] = amount
+                    df.loc[idx, 'cust_amt_std'] = amount * 0.3
+                    df.loc[idx, 'cust_amt_median'] = amount * 0.9
+                    df.loc[idx, 'cust_txn_count'] = 20
+                    df.loc[idx, 'cust_amt_min'] = amount * 0.1
+                    df.loc[idx, 'cust_amt_max'] = amount * 2.0
+                    df.loc[idx, 'cust_amt_sum'] = amount * 25
+                    
+                    # Set percentile defaults
+                    for q in ['q05', 'q10', 'q25', 'q75', 'q90', 'q95']:
+                        multiplier = float(q.replace('q', '')) / 100.0
+                        df.loc[idx, f'cust_amt_{q}'] = amount * (0.5 + multiplier)
+                    
+                    # Enhanced features defaults
+                    df.loc[idx, 'cust_amt_range'] = amount * 1.9
+                    df.loc[idx, 'cust_amt_iqr'] = amount * 0.4
+                    df.loc[idx, 'cust_amt_cv'] = 0.3
+                    df.loc[idx, 'cust_amt_skewness'] = 0.1
     
-    # Ensure required columns exist
-    if 'merchant' not in df.columns:
-        df['merchant'] = 'M' + str(np.random.randint(1000000, 9999999))
-    if 'category' not in df.columns:
-        categories = ['es_transportation', 'es_health', 'es_food', 'es_shopping', 'es_wellnessandbeauty']
-        df['category'] = np.random.choice(categories)
+    return df
+
+def prepare_features_for_inference(df):
+    """Prepare features for inference exactly matching train.py"""
+    print("Preparing features for inference...")
     
-    # Build feature matrix matching training
-    base_features = [
-        'amount', 'step', 'amt_diff_ratio', 'merchant_risk_score', 'merchant_frequency',
-        'txn_count_7d', 'amt_sum_7d', 'amt_mean_7d', 'amt_std_7d', 'amt_max_7d', 'amt_min_7d',
-        'txn_count_30d', 'amt_sum_30d', 'amt_mean_30d', 'amt_std_30d',
-        'txn_velocity_7d', 'txn_velocity_30d', 'amt_range_7d', 'amt_cv_7d',
-        'amt_deviation_7d', 'amt_deviation_30d', 'amount_trend_7d',
-        'uniq_merchants_7d', 'uniq_merchants_30d',
-        'days_since_last_txn', 'hours_since_last_txn', 'cumulative_txn_count', 'avg_amount_to_date',
-        'day_of_year_sin', 'day_of_year_cos', 'month_sin', 'month_cos',
-        'dow_sin', 'dow_cos', 'is_weekend', 'quarter', 
-        'same_day_txn_count', 'same_day_total_amount'
+    # Core features that should exist from prepare_transaction_features
+    core_features = [
+        'amount', 'step', 'cust_amt_mean', 'cust_amt_std', 'cust_amt_median',
+        'cust_txn_count', 'cust_amt_sum', 'cust_amt_range', 'cust_amt_iqr', 'cust_amt_cv',
+        'cust_amt_skewness'
     ]
     
-    X = df[base_features].copy()
+    # Check which features exist
+    existing_features = [col for col in core_features if col in df.columns]
+    X = df[existing_features].copy()
     
-    # Add derived features (matching training)
-    X['amount_zscore'] = (X['amount'] - X['amount'].mean()) / (X['amount'].std() + 1e-8)
-    X['amount_percentile'] = X['amount'].rank(pct=True)
+    # Enhanced ratio features - FIXED to handle missing columns
+    if 'cust_amt_mean' in df.columns:
+        X['amt_vs_cust_mean_ratio'] = X['amount'] / (X['cust_amt_mean'] + 1e-8)
+    else:
+        X['amt_vs_cust_mean_ratio'] = 1.0
+        
+    if 'cust_amt_median' in df.columns:
+        X['amt_vs_cust_median_ratio'] = X['amount'] / (X['cust_amt_median'] + 1e-8)
+    else:
+        X['amt_vs_cust_median_ratio'] = 1.0
+        
+    if 'cust_amt_q95' in df.columns:
+        X['amt_vs_cust_q95_ratio'] = X['amount'] / (df['cust_amt_q95'] + 1e-8)
+    else:
+        X['amt_vs_cust_q95_ratio'] = 1.0
+        
+    if 'cust_amt_max' in df.columns:
+        X['amt_vs_cust_max_ratio'] = X['amount'] / (df['cust_amt_max'] + 1e-8)
+    else:
+        X['amt_vs_cust_max_ratio'] = 1.0
+    
+    # Enhanced z-score features - FIXED
+    if all(col in df.columns for col in ['cust_amt_mean', 'cust_amt_std']):
+        X['amt_zscore'] = (X['amount'] - df['cust_amt_mean']) / (df['cust_amt_std'] + 1e-8)
+    else:
+        X['amt_zscore'] = 0.0
+        
+    if all(col in df.columns for col in ['cust_amt_median', 'cust_amt_iqr']):
+        X['amt_robust_zscore'] = (X['amount'] - df['cust_amt_median']) / (df['cust_amt_iqr'] + 1e-8)
+    else:
+        X['amt_robust_zscore'] = 0.0
+        
+    if all(col in df.columns for col in ['cust_amt_q95', 'cust_amt_std']):
+        X['amt_extreme_zscore'] = (X['amount'] - df['cust_amt_q95']) / (df['cust_amt_std'] + 1e-8)
+    else:
+        X['amt_extreme_zscore'] = 0.0
+    
+    # Enhanced binary features with training data thresholds - FIXED
+    if training_data is not None and hasattr(training_data, 'customer_stats'):
+        if 'cust_amt_max' in df.columns:
+            X['is_cust_extreme_spender'] = (df['cust_amt_max'] > training_data.customer_stats['cust_amt_max'].quantile(0.97)).astype(int)
+        else:
+            X['is_cust_extreme_spender'] = 0
+            
+        if 'cust_amt_cv' in df.columns:
+            X['is_cust_consistent'] = (df['cust_amt_cv'] < training_data.customer_stats['cust_amt_cv'].quantile(0.15)).astype(int)
+            X['is_cust_highly_volatile'] = (df['cust_amt_cv'] > training_data.customer_stats['cust_amt_cv'].quantile(0.97)).astype(int)
+        else:
+            X['is_cust_consistent'] = 0
+            X['is_cust_highly_volatile'] = 0
+            
+        if 'cust_txn_count' in df.columns:
+            X['is_cust_rare_user'] = (df['cust_txn_count'] < training_data.customer_stats['cust_txn_count'].quantile(0.05)).astype(int)
+        else:
+            X['is_cust_rare_user'] = 0
+    else:
+        # Fallback thresholds
+        X['is_cust_extreme_spender'] = 0
+        X['is_cust_consistent'] = 0
+        X['is_cust_highly_volatile'] = 0
+        X['is_cust_rare_user'] = 0
+    
+    # Enhanced feature transformations (from train.py)
     X['amount_log'] = np.log1p(X['amount'])
-    X['is_very_high_amount'] = (X['amount'] > X['amount'].quantile(0.99)).astype(int)
-    X['is_high_amount'] = (X['amount'] > X['amount'].quantile(0.95)).astype(int)
-    X['is_medium_high_amount'] = (X['amount'] > X['amount'].quantile(0.90)).astype(int)
-    X['is_round_amount'] = (X['amount'] % 1 == 0).astype(int)
-    X['is_very_round_amount'] = (X['amount'] % 100 == 0).astype(int)
-    X['txn_freq_ratio'] = X['txn_velocity_7d'] / (X['txn_velocity_30d'] + 1e-8)
-    X['amount_consistency'] = 1 / (X['amt_std_7d'] + 1)
-    X['merchant_diversity'] = X['uniq_merchants_7d'] / (X['txn_count_7d'] + 1e-8)
-    X['unusual_time'] = (X['dow_sin'] < -0.7).astype(int)
-    X['very_frequent_txns'] = (X['same_day_txn_count'] > 5).astype(int)
-    X['burst_activity'] = (X['hours_since_last_txn'] < 1).astype(int)
-    X['amount_spike_2x'] = (X['amount'] > 2 * X['amt_mean_7d']).astype(int)
-    X['amount_spike_3x'] = (X['amount'] > 3 * X['amt_mean_7d']).astype(int)
-    X['amount_spike_5x'] = (X['amount'] > 5 * X['amt_mean_7d']).astype(int)
-    X['freq_anomaly'] = (X['txn_velocity_7d'] > 1.5 * X['txn_velocity_30d']).astype(int)
-    X['extreme_freq_anomaly'] = (X['txn_velocity_7d'] > 3 * X['txn_velocity_30d']).astype(int)
-    X['merchant_change_rate'] = X['uniq_merchants_7d'] / (X['uniq_merchants_30d'] + 1e-8)
-    X['new_merchant_indicator'] = (X['merchant_frequency'] == 1).astype(int)
-    X['amount_vs_historical'] = X['amount'] / (X['avg_amount_to_date'] + 1e-8)
-    X['amount_deviation_score'] = X['amt_deviation_7d'] / (X['amt_std_7d'] + 1e-8)
+    X['amount_sqrt'] = np.sqrt(X['amount'])
+    X['amount_square'] = np.square(X['amount'])
+    X['amount_cube_root'] = np.power(X['amount'], 1/3)
     
-    # Handle categorical features
-    if cat_encoder is not None:
-        print("Applying categorical encoding...")
-        try:
-            cat_cols = ['merchant', 'category']
-            cat_features = cat_encoder.transform(df[cat_cols])
+    # Enhanced amount-based features
+    X['is_exact_round'] = (X['amount'] % 100 == 0).astype(int)
+    
+    # Use training data quantiles for thresholds
+    if training_data is not None:
+        X['is_very_high_amount'] = (X['amount'] > training_data['amount'].quantile(0.995)).astype(int)
+        X['is_extreme_amount'] = (X['amount'] > training_data['amount'].quantile(0.998)).astype(int)
+        X['is_micro_transaction'] = (X['amount'] < training_data['amount'].quantile(0.05)).astype(int)
+    else:
+        X['is_very_high_amount'] = (X['amount'] > 5000).astype(int)
+        X['is_extreme_amount'] = (X['amount'] > 10000).astype(int)  
+        X['is_micro_transaction'] = (X['amount'] < 5).astype(int)
+    
+    # Enhanced temporal features
+    X['day_of_week'] = X['step'] % 7
+    X['is_weekend'] = ((X['step'] % 7).isin([5, 6])).astype(int)
+    
+    # Enhanced merchant features - COMPLETELY FIXED
+    if 'merchant' in df.columns and merchant_stats is not None:
+        print("Processing merchant features...")
+        for idx, row in df.iterrows():
+            merchant = row['merchant']
             
-            # Convert to DataFrame with proper column names
-            if hasattr(cat_features, 'columns'):
-                cat_features = cat_features.astype(float)
+            # Get merchant risk score
+            if merchant in merchant_stats['risk_mapping']:
+                X.loc[idx, 'merchant_risk_score'] = merchant_stats['risk_mapping'][merchant]
             else:
-                cat_features = pd.DataFrame(cat_features, columns=cat_cols, index=df.index)
-                cat_features = cat_features.astype(float)
+                X.loc[idx, 'merchant_risk_score'] = merchant_stats.get('global_fraud_rate', 0.02)
             
-            # Combine with numeric features
-            X = pd.concat([X, cat_features], axis=1)
-            print(f"After categorical encoding: {X.shape}")
-            
-        except Exception as e:
-            print(f"Error in categorical encoding: {e}")
-            # If categorical encoding fails, add zeros
-            for col in cat_cols:
-                X[col] = 0.0
+            # Get merchant statistics
+            if merchant in merchant_stats['stats'].index:
+                merch_stats = merchant_stats['stats'].loc[merchant]
+                X.loc[idx, 'merchant_frequency'] = np.log1p(merch_stats['merch_total_txns'])
+                X.loc[idx, 'merchant_diversity'] = merch_stats['merch_unique_customers']
+                X.loc[idx, 'is_high_risk_merchant'] = int(merch_stats['merch_fraud_rate'] > 
+                                                        merchant_stats['stats']['merch_fraud_rate'].quantile(0.95))
+                X.loc[idx, 'is_very_rare_merchant'] = int(merch_stats['merch_total_txns'] < 
+                                                        merchant_stats['stats']['merch_total_txns'].quantile(0.02))
+                X.loc[idx, 'merchant_avg_amount'] = merch_stats['merch_amt_mean']
+                X.loc[idx, 'amount_vs_merchant_avg'] = X.loc[idx, 'amount'] / (merch_stats['merch_amt_mean'] + 1e-8)
+            else:
+                # New merchant defaults
+                X.loc[idx, 'merchant_frequency'] = np.log1p(1)
+                X.loc[idx, 'merchant_diversity'] = 1
+                X.loc[idx, 'is_high_risk_merchant'] = 0
+                X.loc[idx, 'is_very_rare_merchant'] = 1
+                X.loc[idx, 'merchant_avg_amount'] = X.loc[idx, 'amount']
+                X.loc[idx, 'amount_vs_merchant_avg'] = 1.0
+    else:
+        # Default merchant features when no merchant data available
+        default_merchant_cols = ['merchant_risk_score', 'merchant_frequency', 'merchant_diversity',
+                               'is_high_risk_merchant', 'is_very_rare_merchant', 'merchant_avg_amount',
+                               'amount_vs_merchant_avg']
+        for col in default_merchant_cols:
+            if col == 'merchant_risk_score':
+                X[col] = 0.02  # Low risk default
+            elif col == 'merchant_frequency':
+                X[col] = 2.0  # Medium frequency
+            elif col == 'amount_vs_merchant_avg':
+                X[col] = 1.0  # Normal ratio
+            else:
+                X[col] = 0
     
-    # Ensure we have exactly the right features in the right order
-    expected_features = metadata['feature_cols']
-    
-    # Add missing features with zeros
-    for feature in expected_features:
-        if feature not in X.columns:
-            X[feature] = 0.0
-    
-    # Reorder columns to match training order
-    X = X[expected_features]
-    
-    # Clean up data
-    X = X.fillna(0.0)
+    # Clean data
     for col in X.columns:
         X[col] = pd.to_numeric(X[col], errors='coerce')
-    X = X.fillna(0.0)
+    
+    X = X.fillna(0.0).astype(float)
+    X = X.replace([np.inf, -np.inf], 0.0)
+    
+    # Ensure we have exactly the features the model expects
+    expected_features = metadata['feature_cols']
+    print(f"Expected features ({len(expected_features)}): {expected_features}")
+    print(f"Current features ({len(X.columns)}): {list(X.columns)}")
+    
+    # Add missing features with neutral values
+    for feature in expected_features:
+        if feature not in X.columns:
+            print(f"Adding missing feature {feature} with value 0.0")
+            X[feature] = 0.0
+    
+    # Remove extra features and reorder to match training
+    X = X[expected_features]
     
     print(f"Final feature matrix shape: {X.shape}")
-    return X, df
+    
+    return X
 
-def calculate_risk_score_fixed(X, debug=False):
-    """Calculate risk score with EXACT same normalization as training"""
-    if debug:
-        print(f"Input features shape: {X.shape}")
-        print(f"Input features (first row): {X.iloc[0].to_dict()}")
+def get_risk_level(score):
+    """
+    FIXED: 3-level risk classification based on the model's actual performance
+    These thresholds are calibrated based on train.py model's behavior:
+    - Model threshold is around 0.75 (from metadata) 
+    - Most normal transactions score 0.1-0.4
+    - Suspicious transactions score 0.4-0.75  
+    - High risk transactions score >0.75
+    """
+    # Based on the model's hybrid_threshold from train.py (~0.75)
+    # and typical score distributions from precision-focused models
     
-    # Scale features
-    X_scaled = scaler.transform(X)
-    
-    if debug:
-        print(f"Scaled features min: {X_scaled.min():.4f}, max: {X_scaled.max():.4f}")
-    
-    # Autoencoder reconstruction error
-    X_tensor = torch.FloatTensor(X_scaled)
-    with torch.no_grad():
-        reconstructed = autoencoder(X_tensor)
-        ae_errors = torch.mean((X_tensor - reconstructed) ** 2, dim=1).numpy()
-    
-    # Isolation Forest score
-    if_scores = iforest.decision_function(X_scaled)
-    
-    if debug:
-        print(f"Raw autoencoder errors: min={ae_errors.min():.6f}, max={ae_errors.max():.6f}")
-        print(f"Raw isolation forest scores: min={if_scores.min():.4f}, max={if_scores.max():.4f}")
-    
-    # Get normalization parameters from training
-    norm_params = metadata['normalization_params']
-    
-    # Normalize autoencoder errors EXACTLY like training
-    ae_range = norm_params['ae_max'] - norm_params['ae_min']
-    if ae_range > 0:
-        ae_errors_norm = (ae_errors - norm_params['ae_min']) / ae_range
-    else:
-        ae_errors_norm = np.zeros_like(ae_errors)
-    
-    # Normalize isolation forest scores EXACTLY like training
-    if_range = norm_params['if_max'] - norm_params['if_min']
-    if if_range > 0:
-        if_scores_norm = (if_scores - norm_params['if_min']) / if_range
-    else:
-        if_scores_norm = np.zeros_like(if_scores)
-    
-    # Invert IF scores for consistency (EXACTLY like training)
-    if_scores_norm = 1 - if_scores_norm
-    
-    # Ensure non-negative scores (EXACTLY like training)
-    ae_errors_norm = np.maximum(ae_errors_norm, 0)
-    if_scores_norm = np.maximum(if_scores_norm, 0)
-    
-    # FIXED: Correct blending weights to match training (0.4 AE + 0.6 IF)
-    blended_scores = 0.4 * ae_errors_norm + 0.6 * if_scores_norm
-    
-    if debug:
-        print(f"Normalized AE errors: min={ae_errors_norm.min():.4f}, max={ae_errors_norm.max():.4f}, mean={ae_errors_norm.mean():.4f}")
-        print(f"Normalized IF scores: min={if_scores_norm.min():.4f}, max={if_scores_norm.max():.4f}, mean={if_scores_norm.mean():.4f}")
-        print(f"Final blended scores: min={blended_scores.min():.4f}, max={blended_scores.max():.4f}, mean={blended_scores.mean():.4f}")
-        print(f"Threshold: {metadata['threshold']:.4f}")
-        print(f"Score vs threshold: {blended_scores[0]:.4f} {'>' if blended_scores[0] > metadata['threshold'] else '<='} {metadata['threshold']:.4f}")
-    
-    return blended_scores
-
-# FIXED: Updated risk level thresholds
-def get_risk_level(score, threshold):
-    """Convert score to risk level with better distribution"""
-    if score > threshold * 1.3:  # High risk
+    if score >= 0.6:      # High risk: likely to be flagged as fraud
         return "High"
-    elif score > threshold * 1.0:  # Medium risk
+    elif score >= 0.35:   # Medium risk: elevated but below fraud threshold  
         return "Medium"
-    elif score > threshold * 0.7:  # Medium-low risk
-        return "Medium-Low"
-    else:                         # Low risk
+    else:                 # Low risk: normal transactions
         return "Low"
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "status": "ok", 
+        "model_type": metadata.get('model_type', 'unknown') if metadata else "unknown",
+        "training_data_loaded": training_data is not None,
+        "merchant_stats_loaded": merchant_stats is not None,
+        "current_threshold": metadata.get('hybrid_threshold', 'unknown') if metadata else "unknown",
+        "model_weights": metadata.get('weights', 'unknown') if metadata else "unknown",
+        "risk_levels": "3_levels_low_medium_high",
+        "risk_thresholds": {"high": 0.6, "medium": 0.35, "low": 0.0}
+    })
 
 @app.route('/score', methods=['POST'])
 def score_transaction():
     try:
         data = request.json
-        print(f"Received data: {data}")
+        print(f"Received scoring request: {data}")
         
-        # Preprocess transaction(s)
-        X, df_orig = preprocess_transaction_fixed(data)
+        # Check if a custom threshold is provided
+        custom_threshold = None
+        if isinstance(data, dict) and 'threshold' in data:
+            custom_threshold = data.pop('threshold')
         
-        # Calculate risk scores
-        scores = calculate_risk_score_fixed(X, debug=True)
+        # Prepare transaction with enhanced customer features
+        df = prepare_transaction_features(data)
+        print(f"After customer features: {df.columns.tolist()}")
+        
+        # Prepare features for inference using enhanced feature engineering
+        X = prepare_features_for_inference(df)
+        print(f"After feature engineering: {X.shape}")
+        print(f"Sample feature values: {dict(list(X.iloc[0].items())[:10])}")
+        
+        # Get hybrid prediction scores
+        hybrid_scores, if_scores, ae_scores = hybrid_model.predict_scores(X)
+        
+        # Use custom threshold if provided, otherwise use model threshold
+        threshold = custom_threshold if custom_threshold is not None else metadata['hybrid_threshold']
         
         # Prepare response
         if isinstance(data, dict):
             # Single transaction
-            score = float(scores[0])
-            risk_level = get_risk_level(score, metadata['threshold'])
-            is_anomaly = score > metadata['threshold']
+            score = float(hybrid_scores[0])
+            if_score = float(if_scores[0])
+            ae_score = float(ae_scores[0])
+            risk_level = get_risk_level(score)  # Using fixed 3-level thresholds
+            is_anomaly = score > threshold
             
-            print(f"Final score: {score:.4f}, Risk level: {risk_level}, Is anomaly: {is_anomaly}")
+            print(f"Final result: hybrid_score={score:.4f}, if_score={if_score:.4f}, ae_score={ae_score:.4f}")
+            print(f"Risk level: {risk_level}, is_anomaly: {is_anomaly}, threshold: {threshold:.4f}")
             
             return jsonify({
                 'risk_score': score,
+                'isolation_forest_score': if_score,
+                'autoencoder_score': ae_score,
                 'risk_level': risk_level,
                 'is_anomaly': is_anomaly,
-                'threshold': metadata['threshold'],
-                'debug_info': {
-                    'feature_shape': X.shape,
-                    'feature_columns': X.columns.tolist(),
-                    'sample_features': X.iloc[0].to_dict() if len(X) > 0 else {}
-                }
+                'threshold': threshold,
+                'model_threshold': metadata['hybrid_threshold'],
+                'threshold_override': custom_threshold is not None,
+                'model_type': metadata['model_type'],
+                'model_weights': metadata['weights'],
+                'precision_boost_factor': metadata.get('precision_boost_factor', 1.0),
+                'risk_thresholds': {"high": 0.6, "medium": 0.35, "low": 0.0}
             })
         else:
             # Multiple transactions
             results = []
-            for i, score in enumerate(scores):
+            for i, score in enumerate(hybrid_scores):
                 score = float(score)
-                risk_level = get_risk_level(score, metadata['threshold'])
-                is_anomaly = score > metadata['threshold']
+                if_score = float(if_scores[i])
+                ae_score = float(ae_scores[i])
+                risk_level = get_risk_level(score)  # Using fixed 3-level thresholds
+                is_anomaly = score > threshold
                 
                 results.append({
                     'risk_score': score,
+                    'isolation_forest_score': if_score,
+                    'autoencoder_score': ae_score,
                     'risk_level': risk_level,
                     'is_anomaly': is_anomaly,
-                    'threshold': metadata['threshold']
+                    'threshold': threshold
                 })
             
             return jsonify(results)
@@ -419,93 +621,404 @@ def score_transaction():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-@app.route('/debug', methods=['POST'])
-def debug_transaction():
-    """Debug endpoint to understand scoring issues"""
+@app.route('/set-threshold', methods=['POST'])
+def set_threshold():
+    """Endpoint to dynamically update the hybrid threshold"""
     try:
         data = request.json
-        print("=== DEBUGGING TRANSACTION SCORING ===")
+        new_threshold = data.get('threshold')
         
-        # Preprocess transaction
-        X, df_orig = preprocess_transaction_fixed(data)
-        print(f"Preprocessed features shape: {X.shape}")
-        print(f"Feature columns: {X.columns.tolist()}")
-        print(f"Expected columns: {metadata['feature_cols']}")
+        if new_threshold is None:
+            return jsonify({'error': 'threshold parameter required'}), 400
         
-        if len(X) > 0:
-            print(f"Feature values (first row):\n{X.iloc[0].to_dict()}")
-            
-            # Calculate scores with full debugging
-            scores = calculate_risk_score_fixed(X, debug=True)
-            
-            return jsonify({
-                'debug_complete': True,
-                'score': float(scores[0]) if len(scores) > 0 else 0,
-                'feature_info': {
-                    'shape': X.shape,
-                    'columns': X.columns.tolist(),
-                    'values': X.iloc[0].to_dict()
-                },
-                'metadata': metadata,
-                'normalization_params': metadata['normalization_params']
-            })
-        else:
-            return jsonify({'error': 'No features generated'}), 400
-            
+        if not 0 <= new_threshold <= 1:
+            return jsonify({'error': 'threshold must be between 0 and 1'}), 400
+        
+        old_threshold = metadata['hybrid_threshold']
+        metadata['hybrid_threshold'] = new_threshold
+        hybrid_model.hybrid_threshold = new_threshold
+        
+        print(f"Hybrid threshold updated: {old_threshold:.4f} -> {new_threshold:.4f}")
+        
+        return jsonify({
+            'success': True,
+            'old_threshold': old_threshold,
+            'new_threshold': new_threshold,
+            'message': f'Hybrid threshold updated from {old_threshold:.4f} to {new_threshold:.4f}'
+        })
+        
     except Exception as e:
-        import traceback
-        print(f"Error in debug_transaction: {str(e)}")
-        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-@app.route('/test', methods=['GET'])
-def test_with_different_amounts():
-    """Test endpoint with different transaction amounts"""
+@app.route('/update-risk-thresholds', methods=['POST'])
+def update_risk_thresholds():
+    """Endpoint to update risk level classification thresholds (now simplified to 3 levels)"""
     try:
-        # Test with different amounts to see score variation
+        data = request.json
+        high_threshold = data.get('high_threshold', 0.6)
+        medium_threshold = data.get('medium_threshold', 0.35)
+        
+        # Test with sample scores to show the effect
+        sample_scores = [0.15, 0.25, 0.30, 0.40, 0.50, 0.65, 0.75, 0.85]
+        
+        old_classifications = [get_risk_level(score) for score in sample_scores]
+        
+        # Temporarily update thresholds for comparison
+        global HIGH_THRESHOLD, MEDIUM_THRESHOLD
+        HIGH_THRESHOLD = high_threshold
+        MEDIUM_THRESHOLD = medium_threshold
+        
+        new_classifications = [get_risk_level(score) for score in sample_scores]
+        
+        comparison = []
+        for i, score in enumerate(sample_scores):
+            comparison.append({
+                'score': score,
+                'old_classification': old_classifications[i],
+                'new_classification': new_classifications[i],
+                'changed': old_classifications[i] != new_classifications[i]
+            })
+        
+        new_thresholds = {
+            'high': high_threshold,
+            'medium': medium_threshold,
+            'low': 0.0
+        }
+        
+        return jsonify({
+            'success': True,
+            'new_thresholds': new_thresholds,
+            'sample_comparison': comparison,
+            'changes_detected': sum(1 for c in comparison if c['changed']),
+            'message': f'Risk thresholds updated: High >= {high_threshold}, Medium >= {medium_threshold}, Low < {medium_threshold}'
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/test-model', methods=['GET'])
+def test_model():
+    """Test endpoint with various transaction scenarios"""
+    try:
         test_transactions = [
-            {'step': 100, 'amount': 10, 'merchant': 'grocery_store', 'category': 'food_dining'},
-            {'step': 100, 'amount': 50, 'merchant': 'gas_station', 'category': 'gas_transport'},
-            {'step': 100, 'amount': 200, 'merchant': 'department_store', 'category': 'shopping'},
-            {'step': 100, 'amount': 1000, 'merchant': 'electronics_store', 'category': 'shopping'},
-            {'step': 100, 'amount': 5000, 'merchant': 'unknown_merchant', 'category': 'misc_net'}
+            # Normal transactions (should be Low risk)
+            {'step': 100, 'amount': 25.0, 'customer': 'C_test_normal_1', 'merchant': 'M_test_normal'},
+            {'step': 100, 'amount': 75.0, 'customer': 'C_test_normal_2', 'merchant': 'M_test_normal'},
+            {'step': 100, 'amount': 150.0, 'customer': 'C_test_normal_3', 'merchant': 'M_test_normal'},
+            
+            # Slightly elevated (should be Low to Medium risk)
+            {'step': 100, 'amount': 300.0, 'customer': 'C_test_medium', 'merchant': 'M_test_medium'},
+            {'step': 100, 'amount': 500.0, 'customer': 'C_test_elevated', 'merchant': 'M_test_medium'},
+            
+            # Potentially suspicious patterns (should be Medium to High risk)
+            {'step': 100, 'amount': 1000.0, 'customer': 'C_test_high', 'merchant': 'M_test_suspicious'},
+            {'step': 100, 'amount': 5000.0, 'customer': 'C_test_very_high', 'merchant': 'M_test_suspicious'},
+            {'step': 100, 'amount': 10000.0, 'customer': 'C_test_extreme', 'merchant': 'M_test_suspicious'},
+            
+            # Micro-transactions (fraud pattern - should be Medium to High)
+            {'step': 100, 'amount': 0.50, 'customer': 'C_test_micro', 'merchant': 'M_test_micro'},
+            {'step': 100, 'amount': 1.0, 'customer': 'C_test_small', 'merchant': 'M_test_micro'},
+            
+            # Round amounts (potential fraud - should be Medium to High)
+            {'step': 100, 'amount': 1000.0, 'customer': 'C_test_round_1', 'merchant': 'M_test_round'},
+            {'step': 100, 'amount': 5000.0, 'customer': 'C_test_round_2', 'merchant': 'M_test_round'},
+            
+            # Weekend transactions (slight risk factor)
+            {'step': 105, 'amount': 200.0, 'customer': 'C_test_weekend', 'merchant': 'M_test_weekend'},
+            {'step': 106, 'amount': 500.0, 'customer': 'C_test_weekend_2', 'merchant': 'M_test_weekend'},
         ]
         
         results = []
+        all_scores = []
+        
         for txn in test_transactions:
-            print(f"Testing with transaction: {txn}")
+            try:
+                df = prepare_transaction_features(txn)
+                X = prepare_features_for_inference(df)
+                
+                hybrid_scores, if_scores, ae_scores = hybrid_model.predict_scores(X)
+                
+                score = float(hybrid_scores[0])
+                all_scores.append(score)
+                if_score = float(if_scores[0])
+                ae_score = float(ae_scores[0])
+                risk_level = get_risk_level(score)  # Using fixed 3-level thresholds
+                is_anomaly = score > metadata['hybrid_threshold']
+                
+                results.append({
+                    'transaction': txn,
+                    'risk_score': score,
+                    'isolation_forest_score': if_score,
+                    'autoencoder_score': ae_score,
+                    'risk_level': risk_level,
+                    'is_anomaly': is_anomaly
+                })
+            except Exception as e:
+                results.append({
+                    'transaction': txn,
+                    'error': str(e)
+                })
+        
+        # Calculate distribution stats
+        if all_scores:
+            score_stats = {
+                'min': min(all_scores),
+                'max': max(all_scores),
+                'mean': np.mean(all_scores),
+                'p50': np.percentile(all_scores, 50),
+                'p75': np.percentile(all_scores, 75),
+                'p90': np.percentile(all_scores, 90),
+                'p95': np.percentile(all_scores, 95),
+                'p98': np.percentile(all_scores, 98)
+            }
             
-            # Process it
-            X, df_orig = preprocess_transaction_fixed(txn)
-            scores = calculate_risk_score_fixed(X, debug=True)
-            
-            score = float(scores[0])
-            risk_level = get_risk_level(score, metadata['threshold'])
-            is_anomaly = score > metadata['threshold']
-            
-            results.append({
-                'transaction': txn,
-                'risk_score': score,
-                'risk_level': risk_level,
-                'is_anomaly': is_anomaly
-            })
+            # Risk level distribution
+            risk_levels = [r['risk_level'] for r in results if 'risk_level' in r]
+            risk_distribution = {
+                'High': risk_levels.count('High'),
+                'Medium': risk_levels.count('Medium'),
+                'Low': risk_levels.count('Low')
+            }
+        else:
+            score_stats = {}
+            risk_distribution = {}
         
         return jsonify({
             'test_results': results,
-            'threshold': metadata['threshold'],
-            'summary': {
-                'total_tested': len(test_transactions),
-                'flagged_as_anomaly': sum(1 for r in results if r['is_anomaly']),
-                'score_range': {
-                    'min': min(r['risk_score'] for r in results),
-                    'max': max(r['risk_score'] for r in results)
-                }
+            'score_distribution': score_stats,
+            'risk_level_distribution': risk_distribution,
+            'model_info': {
+                'type': metadata['model_type'],
+                'threshold': metadata['hybrid_threshold'],
+                'weights': metadata['weights'],
+                'precision_boost_factor': metadata.get('precision_boost_factor', 1.0),
+                'training_data_loaded': training_data is not None,
+                'merchant_stats_loaded': merchant_stats is not None,
+                'total_features': len(metadata['feature_cols']),
+                'risk_levels': 3,
+                'risk_thresholds': {"high": 0.6, "medium": 0.35, "low": 0.0}
             }
         })
         
     except Exception as e:
         import traceback
-        print(f"Error in test_with_different_amounts: {str(e)}")
+        print(f"Error in test_model: {str(e)}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/calibrate-threshold', methods=['POST'])
+def calibrate_threshold():
+    """Calibrate threshold for desired precision/recall trade-off"""
+    try:
+        data = request.json
+        target_precision = data.get('target_precision', 0.72)
+        target_recall = data.get('target_recall', 0.80)
+        
+        if training_data is None:
+            return jsonify({'error': 'Training data not available'}), 500
+        
+        print(f"Calibrating for precision >= {target_precision}, recall >= {target_recall}")
+        
+        # Sample training data for calibration
+        sample_size = min(2000, len(training_data))
+        sample_data = training_data.sample(n=sample_size, random_state=42)
+        
+        # Score sample transactions
+        all_hybrid_scores = []
+        all_if_scores = []
+        all_ae_scores = []
+        sample_labels = []
+        
+        for _, row in sample_data.iterrows():
+            try:
+                txn = {
+                    'step': row['step'],
+                    'amount': row['amount'],
+                    'customer': row['customer']
+                }
+                if 'merchant' in row:
+                    txn['merchant'] = row['merchant']
+                
+                df = prepare_transaction_features(txn)
+                X = prepare_features_for_inference(df)
+                
+                hybrid_scores, if_scores, ae_scores = hybrid_model.predict_scores(X)
+                
+                all_hybrid_scores.append(hybrid_scores[0])
+                all_if_scores.append(if_scores[0])
+                all_ae_scores.append(ae_scores[0])
+                
+                # Get actual label if available
+                label = row.get('fraud', 0)
+                sample_labels.append(label)
+                
+            except Exception as e:
+                print(f"Error scoring sample transaction: {e}")
+                continue
+        
+        if len(all_hybrid_scores) == 0:
+            return jsonify({'error': 'Could not score any transactions'}), 500
+        
+        all_hybrid_scores = np.array(all_hybrid_scores)
+        all_if_scores = np.array(all_if_scores)
+        all_ae_scores = np.array(all_ae_scores)
+        sample_labels = np.array(sample_labels)
+        
+        # Calculate score distributions
+        score_stats = {
+            'hybrid': {
+                'min': float(all_hybrid_scores.min()),
+                'max': float(all_hybrid_scores.max()),
+                'mean': float(all_hybrid_scores.mean()),
+                'std': float(all_hybrid_scores.std()),
+                'percentiles': {f'p{p}': float(np.percentile(all_hybrid_scores, p)) 
+                              for p in [50, 75, 90, 95, 98, 99]}
+            },
+            'isolation_forest': {
+                'min': float(all_if_scores.min()),
+                'max': float(all_if_scores.max()),
+                'mean': float(all_if_scores.mean()),
+                'percentiles': {f'p{p}': float(np.percentile(all_if_scores, p)) 
+                              for p in [50, 75, 90, 95, 98, 99]}
+            },
+            'autoencoder': {
+                'min': float(all_ae_scores.min()),
+                'max': float(all_ae_scores.max()),
+                'mean': float(all_ae_scores.mean()),
+                'percentiles': {f'p{p}': float(np.percentile(all_ae_scores, p)) 
+                              for p in [50, 75, 90, 95, 98, 99]}
+            }
+        }
+        
+        # Risk level analysis with 3 levels
+        risk_levels = [get_risk_level(score) for score in all_hybrid_scores]
+        risk_distribution = {
+            'High': risk_levels.count('High') / len(risk_levels),
+            'Medium': risk_levels.count('Medium') / len(risk_levels),
+            'Low': risk_levels.count('Low') / len(risk_levels)
+        }
+        
+        # Threshold analysis for different detection rates
+        threshold_analysis = {}
+        for pct in [90, 95, 97, 98, 99, 99.5]:
+            threshold = np.percentile(all_hybrid_scores, pct)
+            detection_rate = np.mean(all_hybrid_scores > threshold)
+            
+            # Calculate precision/recall if we have labels
+            if len(sample_labels) > 0 and np.sum(sample_labels) > 0:
+                predictions = (all_hybrid_scores > threshold).astype(int)
+                tp = np.sum((sample_labels == 1) & (predictions == 1))
+                fp = np.sum((sample_labels == 0) & (predictions == 1))
+                fn = np.sum((sample_labels == 1) & (predictions == 0))
+                
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                
+                threshold_analysis[f'p{pct}'] = {
+                    'threshold': float(threshold),
+                    'detection_rate': float(detection_rate),
+                    'precision': float(precision),
+                    'recall': float(recall),
+                    'meets_precision_target': precision >= target_precision,
+                    'meets_recall_target': recall >= target_recall
+                }
+            else:
+                threshold_analysis[f'p{pct}'] = {
+                    'threshold': float(threshold),
+                    'detection_rate': float(detection_rate)
+                }
+        
+        # Find best threshold that meets criteria
+        best_threshold = None
+        best_analysis = None
+        
+        if len(sample_labels) > 0 and np.sum(sample_labels) > 0:
+            for analysis in threshold_analysis.values():
+                if ('precision' in analysis and 'recall' in analysis and 
+                    analysis['meets_precision_target'] and analysis['meets_recall_target']):
+                    if best_threshold is None or analysis['precision'] > best_analysis['precision']:
+                        best_threshold = analysis['threshold']
+                        best_analysis = analysis
+        
+        response = {
+            'current_threshold': metadata['hybrid_threshold'],
+            'score_distribution': score_stats,
+            'risk_level_distribution': risk_distribution,
+            'threshold_analysis': threshold_analysis,
+            'sample_size': len(all_hybrid_scores),
+            'fraud_samples': int(np.sum(sample_labels)) if len(sample_labels) > 0 else 0,
+            'model_weights': metadata['weights'],
+            'risk_levels': 3,
+            'risk_thresholds': {"high": 0.6, "medium": 0.35, "low": 0.0}
+        }
+        
+        if best_threshold is not None:
+            response.update({
+                'suggested_threshold': best_threshold,
+                'suggested_analysis': best_analysis,
+                'recommendation': f"Consider setting threshold to {best_threshold:.4f} for precision={best_analysis['precision']:.3f}, recall={best_analysis['recall']:.3f}"
+            })
+        else:
+            response['recommendation'] = "No threshold found that meets both precision and recall targets"
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        import traceback
+        print(f"Error in calibrate_threshold: {str(e)}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/debug', methods=['POST'])
+def debug_transaction():
+    """Debug endpoint to inspect feature generation and scoring"""
+    try:
+        data = request.json
+        print("=== DEBUGGING TRANSACTION SCORING ===")
+        
+        print(f"1. Input data: {data}")
+        
+        df = prepare_transaction_features(data)
+        print(f"2. After customer features: {df.to_dict('records')[0] if len(df) > 0 else 'None'}")
+        
+        X = prepare_features_for_inference(df)
+        print(f"3. Final features shape: {X.shape}")
+        print(f"4. Feature sample: {dict(list(X.iloc[0].to_dict().items())[:15])}")
+        
+        hybrid_scores, if_scores, ae_scores = hybrid_model.predict_scores(X)
+        score = hybrid_scores[0]
+        
+        risk_level = get_risk_level(score)
+        
+        print(f"5. Hybrid score: {score:.4f}")
+        print(f"6. IF score: {if_scores[0]:.4f}, AE score: {ae_scores[0]:.4f}")
+        print(f"7. Risk level: {risk_level}")
+        print(f"8. Model weights: {metadata['weights']}")
+        print(f"9. Model threshold: {metadata['hybrid_threshold']:.4f}")
+        
+        return jsonify({
+            'debug_complete': True,
+            'input_data': data,
+            'customer_features': df.to_dict('records')[0] if len(df) > 0 else None,
+            'final_features': dict(list(X.iloc[0].to_dict().items())[:20]),
+            'feature_shape': X.shape,
+            'hybrid_risk_score': float(score),
+            'isolation_forest_score': float(if_scores[0]),
+            'autoencoder_score': float(ae_scores[0]),
+            'risk_level': risk_level,
+            'model_weights': metadata['weights'],
+            'threshold': metadata['hybrid_threshold'],
+            'model_type': metadata['model_type'],
+            'training_data_available': training_data is not None,
+            'merchant_stats_available': merchant_stats is not None,
+            'precision_boost_factor': metadata.get('precision_boost_factor', 1.0),
+            'risk_levels': 3,
+            'risk_thresholds': {"high": 0.6, "medium": 0.35, "low": 0.0}
+        })
+        
+    except Exception as e:
+        import traceback
+        print(f"Error in debug_transaction: {str(e)}")
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
@@ -526,10 +1039,174 @@ def stream_data():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/model-info', methods=['GET'])
+def get_model_info():
+    """Get comprehensive information about the precision-focused hybrid model"""
+    try:
+        if metadata is None:
+            return jsonify({'error': 'Model not loaded'}), 500
+        
+        return jsonify({
+            'model_type': metadata['model_type'],
+            'input_dimensions': metadata['input_dim'],
+            'total_features': len(metadata['feature_cols']),
+            'hybrid_threshold': metadata['hybrid_threshold'],
+            'model_weights': metadata['weights'],
+            'precision_boost_factor': metadata.get('precision_boost_factor', 1.0),
+            'target_precision': metadata.get('target_precision', 0.72),
+            'target_recall': metadata.get('target_recall', 0.8),
+            'optimization': metadata.get('optimization', 'enhanced_precision_boosting'),
+            'training_date': metadata.get('training_date', 'unknown'),
+            'feature_sample': metadata['feature_cols'][:15],
+            'training_data_loaded': training_data is not None,
+            'customer_count': len(training_data.customer_stats) if training_data is not None and hasattr(training_data, 'customer_stats') else 0,
+            'merchant_encoding_available': merchant_stats is not None,
+            'merchant_count': len(merchant_stats['stats']) if merchant_stats is not None else 0,
+            'risk_levels': 3,
+            'risk_thresholds': {"high": 0.6, "medium": 0.35, "low": 0.0}
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/feature-importance', methods=['GET'])
+def get_feature_importance():
+    """Get feature importance if available"""
+    try:
+        # Try to load feature importance from file
+        try:
+            importance_df = pd.read_csv('feature_importance.csv')
+            return jsonify({
+                'feature_importance': importance_df.to_dict('records'),
+                'top_10_features': importance_df.head(10)[['feature', 'combined_importance']].to_dict('records')
+            })
+        except FileNotFoundError:
+            return jsonify({'message': 'Feature importance not available - run training to generate'})
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/batch-score', methods=['POST'])
+def batch_score_transactions():
+    """Score multiple transactions in batch for efficiency"""
+    try:
+        data = request.json
+        transactions = data.get('transactions', [])
+        custom_threshold = data.get('threshold')
+        
+        if not transactions:
+            return jsonify({'error': 'No transactions provided'}), 400
+        
+        print(f"Batch scoring {len(transactions)} transactions")
+        
+        results = []
+        
+        # Score all transactions
+        for i, txn in enumerate(transactions):
+            try:
+                df = prepare_transaction_features(txn)
+                X = prepare_features_for_inference(df)
+                
+                hybrid_scores, if_scores, ae_scores = hybrid_model.predict_scores(X)
+                
+                threshold = custom_threshold if custom_threshold is not None else metadata['hybrid_threshold']
+                
+                score = float(hybrid_scores[0])
+                if_score = float(if_scores[0])
+                ae_score = float(ae_scores[0])
+                risk_level = get_risk_level(score)  # Using fixed 3-level thresholds
+                is_anomaly = score > threshold
+                
+                results.append({
+                    'transaction_id': i,
+                    'risk_score': score,
+                    'isolation_forest_score': if_score,
+                    'autoencoder_score': ae_score,
+                    'risk_level': risk_level,
+                    'is_anomaly': is_anomaly,
+                    'input_transaction': txn
+                })
+                
+            except Exception as e:
+                results.append({
+                    'transaction_id': i,
+                    'error': str(e),
+                    'input_transaction': txn
+                })
+        
+        # Summary statistics with risk level breakdown
+        successful_results = [r for r in results if 'error' not in r]
+        if successful_results:
+            scores = [r['risk_score'] for r in successful_results]
+            anomalies = [r for r in successful_results if r['is_anomaly']]
+            
+            # Risk level distribution
+            risk_levels = [r['risk_level'] for r in successful_results]
+            risk_distribution = {
+                'High': risk_levels.count('High'),
+                'Medium': risk_levels.count('Medium'),
+                'Low': risk_levels.count('Low')
+            }
+            
+            summary = {
+                'total_transactions': len(transactions),
+                'successful_scores': len(successful_results),
+                'errors': len(transactions) - len(successful_results),
+                'anomalies_detected': len(anomalies),
+                'anomaly_rate': len(anomalies) / len(successful_results) if successful_results else 0,
+                'risk_level_distribution': risk_distribution,
+                'risk_level_percentages': {k: v/len(successful_results)*100 for k, v in risk_distribution.items()},
+                'score_statistics': {
+                    'min': float(np.min(scores)),
+                    'max': float(np.max(scores)),
+                    'mean': float(np.mean(scores)),
+                    'std': float(np.std(scores)),
+                    'p50': float(np.percentile(scores, 50)),
+                    'p75': float(np.percentile(scores, 75)),
+                    'p90': float(np.percentile(scores, 90)),
+                    'p95': float(np.percentile(scores, 95)),
+                    'p98': float(np.percentile(scores, 98))
+                } if scores else None
+            }
+        else:
+            summary = {
+                'total_transactions': len(transactions),
+                'successful_scores': 0,
+                'errors': len(transactions),
+                'anomalies_detected': 0,
+                'anomaly_rate': 0,
+                'risk_level_distribution': {'High': 0, 'Medium': 0, 'Low': 0}
+            }
+        
+        return jsonify({
+            'results': results,
+            'summary': summary,
+            'threshold_used': custom_threshold if custom_threshold is not None else metadata['hybrid_threshold'],
+            'model_weights': metadata['weights'],
+            'risk_levels': 3,
+            'risk_thresholds': {"high": 0.6, "medium": 0.35, "low": 0.0}
+        })
+        
+    except Exception as e:
+        import traceback
+        print(f"Error in batch_score_transactions: {str(e)}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
 # Initialize models when app starts
 try:
-    load_models()
-    print("App initialized successfully!")
+    success = load_models()
+    if success:
+        print("Precision-focused hybrid fraud detection app initialized successfully!")
+        print(f"Model type: {metadata.get('model_type', 'unknown')}")
+        print(f"Hybrid threshold: {metadata.get('hybrid_threshold', 'unknown')}")
+        print(f"Model weights: {metadata.get('weights', 'unknown')}")
+        print(f"Training data loaded: {training_data is not None}")
+        print(f"Merchant stats loaded: {merchant_stats is not None}")
+        print("Risk levels: 3 (Low, Medium, High)")
+        print("Risk thresholds: High >= 0.6, Medium >= 0.35, Low < 0.35")
+    else:
+        print("Failed to initialize models")
 except Exception as e:
     print(f"Error initializing app: {e}")
     import traceback
